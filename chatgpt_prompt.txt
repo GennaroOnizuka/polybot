@@ -1,0 +1,102 @@
+Sono uno sviluppatore Python che sta costruendo un bot di trading per Polymarket (una piattaforma di prediction markets). Ho un problema critico con la connessione WebSocket che si disconnette immediatamente dopo essersi connessa.
+
+CONTESTO DEL PROGETTO:
+- Sto usando Python 3.13
+- Librerie principali: py-clob-client, websocket-client, web3
+- Sto cercando di connettermi al WebSocket market channel di Polymarket per ricevere aggiornamenti dell'orderbook in tempo reale
+- L'URL del WebSocket è: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+IL PROBLEMA:
+Il WebSocket si connette correttamente ("WebSocket connection opened", "WebSocket connected successfully"), ma poi si disconnette immediatamente con l'errore "Connection to remote host was lost" prima ancora che possa inviare il messaggio di sottoscrizione o ricevere dati.
+
+DETTAGLI TECNICI:
+1. Sto usando la libreria `websocket-client` (non `websockets` asyncio)
+2. Il formato del messaggio di sottoscrizione che sto usando è:
+   ```json
+   {
+     "assets_ids": ["token_id_1", "token_id_2", ...],
+     "type": "market"
+   }
+   ```
+3. Sto cercando di sottoscrivermi a 40 token IDs (da 20 markets binari)
+4. Il codice si connette, ma la connessione si chiude prima che possa inviare la sottoscrizione
+
+COSA HO GIÀ PROVATO:
+1. Cambiato il tipo da "market" a "MARKET" (maiuscolo) - non ha funzionato
+2. Cambiato il tipo da "MARKET" a "market" (minuscolo) seguendo la documentazione ufficiale - non ha funzionato
+3. Aggiunto delay dopo la connessione prima di inviare la sottoscrizione
+4. Provato a inviare la sottoscrizione immediatamente nell'handler `on_open`
+5. Implementato heartbeat con ping ogni 10 secondi
+6. Provato batch più piccoli (20 token alla volta invece di 40)
+7. Verificato che l'URL sia corretto: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+RIFERIMENTI CHE HO CONSULTATO:
+- Documentazione ufficiale Polymarket: https://docs.polymarket.com/developers/CLOB/websocket/market-channel
+- Esempio GitHub funzionante: https://github.com/discountry/polymarket-trading-bot (questo usa websockets asyncio invece di websocket-client)
+- Quickstart ufficiale: https://docs.polymarket.com/quickstart/websocket/WSS-Quickstart
+
+OSSERVAZIONI:
+- Il repository GitHub di discountry usa `websockets` (asyncio) invece di `websocket-client` (sincrono)
+- Nel loro codice, il tipo è "MARKET" (maiuscolo) ma nella documentazione ufficiale è "market" (minuscolo)
+- Il loro codice funziona, il mio no
+- La connessione si apre ma si chiude immediatamente, suggerendo che potrebbe essere un problema di formato del messaggio o di timing
+
+DOMANDE SPECIFICHE:
+1. Qual è il formato ESATTO del messaggio di sottoscrizione che devo inviare? Deve essere "market" o "MARKET"?
+2. C'è un problema nell'usare `websocket-client` invece di `websockets` asyncio?
+3. C'è un limite sul numero di token IDs che posso sottoscrivere in un singolo messaggio?
+4. Devo inviare la sottoscrizione immediatamente dopo `on_open` o c'è un delay necessario?
+5. Il server si aspetta qualche messaggio particolare subito dopo la connessione?
+6. Potrebbe essere un problema di autenticazione? Il market channel è pubblico secondo la documentazione.
+
+CODICE ATTUALE (semplificato):
+```python
+import websocket
+import json
+import threading
+import time
+
+class CLOBWebSocketClient:
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    
+    def __init__(self):
+        self.ws = None
+        self.connected = False
+        
+    def connect(self):
+        self.ws = websocket.WebSocketApp(
+            self.WS_URL,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            on_open=self._on_open
+        )
+        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        self.ws_thread.start()
+        time.sleep(2)  # Wait for connection
+        
+    def _on_open(self, ws):
+        self.connected = True
+        print("WebSocket connection opened")
+        # Provo a inviare la sottoscrizione qui
+        subscription = {
+            "assets_ids": ["token1", "token2", ...],  # 40 token IDs
+            "type": "market"
+        }
+        ws.send(json.dumps(subscription))
+        
+    def _on_message(self, ws, message):
+        print(f"Received: {message}")
+        
+    def _on_error(self, ws, error):
+        print(f"WebSocket error: {error}")
+        
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.connected = False
+        print("WebSocket connection closed")
+```
+
+RISULTATO ATTESO:
+Voglio che il WebSocket rimanga connesso e riceva aggiornamenti dell'orderbook in tempo reale per i token a cui mi sono sottoscritto.
+
+Puoi aiutarmi a identificare esattamente cosa sto sbagliando e come risolvere il problema? Preferirei mantenere `websocket-client` se possibile, ma sono aperto a passare a `websockets` asyncio se necessario.

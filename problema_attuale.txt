@@ -1,0 +1,102 @@
+================================================================================
+PROBLEMA ATTUALE — Polymarket Bot (Bitcoin Up or Down 5m)
+================================================================================
+Data: 12 febbraio 2026
+Configurazione: MONITOR_EVENT_SLUG=btc-updown-5m
+
+--------------------------------------------------------------------------------
+LOG ATTUALE (output del terminale)
+--------------------------------------------------------------------------------
+
+  matteogianino@MACBOOKAIR-2755 POLYBOT % python3 bot_async.py
+  CLOB client initialized successfully
+  ============================================================
+  Polymarket Trading Bot Starting...
+  ============================================================
+  🎯 Monitoring specific event: btc-updown-5m
+  🎯 Working only with Bitcoin Up or Down 5m (current active event)
+  ❌ No active Bitcoin Up or Down 5m event found. Try again in a few seconds.
+  No markets found. Exiting.
+
+  Stopping bot...
+  Bot stopped.
+
+--------------------------------------------------------------------------------
+DESCRIZIONE DEL PROBLEMA
+--------------------------------------------------------------------------------
+
+Il bot deve lavorare SOLO con l’evento “Bitcoin Up or Down 5m”:
+  https://polymarket.com/event/btc-updown-5m
+
+All’avvio, con MONITOR_EVENT_SLUG=btc-updown-5m, il flusso è:
+
+1. Il bot riconosce btc-updown-5m e chiama get_active_btc_updown_markets().
+2. get_active_btc_updown_markets() fa:
+   - GET https://gamma-api.polymarket.com/markets?closed=false&enableOrderBook=true&limit=400
+   - Filtra i market dove:
+     - slug contiene "btc-updown-5m" OPPURE
+     - question contiene "bitcoin up or down"
+   - Filtra solo quelli con endDate nel futuro (ora UTC).
+   - Ordina per endDate crescente e prende la finestra corrente.
+3. Questa funzione restituisce una lista VUOTA [].
+4. Fallback: il bot chiama get_active_btc_updown_event() che:
+   - Prova GET /events?active=true&closed=false&limit=250 e filtra per slug/title "btc-updown" / "bitcoin up or down" con endDate nel futuro.
+   - Se non trova nulla, fa fallback su GET /markets (stessi parametri e filtro di cui sopra).
+5. Anche get_active_btc_updown_event() restituisce None.
+6. Risultato: "No active Bitcoin Up or Down 5m event found" e il bot esce.
+
+Quindi: né da /events né da /markets riusciamo a ottenere nessun evento o market “Bitcoin Up or Down 5m” attivo.
+
+--------------------------------------------------------------------------------
+POSSIBILI CAUSE
+--------------------------------------------------------------------------------
+
+1. Filtro troppo restrittivo
+   - Slug effettivo potrebbe essere diverso (es. "btc-up-down-5m", o con timestamp tipo "btc-updown-5m-1770912345").
+   - Il campo "question" potrebbe essere formulato diversamente (es. "Bitcoin Up or Down - February 13, 12:30PM ET" senza la stringa esatta "bitcoin up or down" in minuscolo).
+
+2. Struttura risposta Gamma API
+   - I market potrebbero non avere il campo "events" con event_id, o averlo con nome diverso.
+   - I campi "slug", "question", "endDate" potrebbero avere nomi diversi (es. "end_date", "title" invece di "question").
+
+3. Ordinamento / limit
+   - I market BTC 5m potrebbero essere oltre i primi 400 restituiti da /markets, quindi non arrivano mai nella nostra lista filtrata.
+
+4. Orario / timezone
+   - Il confronto endDate > now usa datetime.now(timezone.utc). Se la Gamma restituisce date in altro formato o timezone, il filtro “endDate nel futuro” potrebbe escludere tutti i market.
+
+5. Eventi/market davvero assenti
+   - Meno probabile: in quel momento potrebbero non esserci eventi 5m aperti (es. finestra tra due creazioni).
+
+6. Rate limit / errore HTTP
+   - La richiesta potrebbe fallire (4xx/5xx) o essere limitata; in quel caso il codice potrebbe restituire [] o None senza stampare l’errore in modo visibile.
+
+--------------------------------------------------------------------------------
+COSA SERVE PER DIAGNOSTICARE
+--------------------------------------------------------------------------------
+
+- Stampare la risposta grezza (o almeno i primi N market) di:
+  GET https://gamma-api.polymarket.com/markets?closed=false&enableOrderBook=true&limit=400
+  per vedere:
+  - nomi dei campi (slug, question, endDate, events, ecc.),
+  - formato delle date,
+  - uno o due esempi di market “Bitcoin Up or Down” se ci sono.
+
+- Verificare se esistono market con slug o titolo che contengono "btc" o "bitcoin" (senza filtri stretti) e ispezionare come sono rappresentati.
+
+- Verificare se la Gamma espone un endpoint di search o per tag/serie (es. “btc-updown-5m” come serie) che restituisca direttamente gli eventi/market attivi.
+
+--------------------------------------------------------------------------------
+OBIETTIVO
+--------------------------------------------------------------------------------
+
+Quando l’utente avvia il bot con MONITOR_EVENT_SLUG=btc-updown-5m, il bot deve:
+
+1. Trovare l’evento (o i market) “Bitcoin Up or Down 5m” attualmente attivo (finestra 5 minuti corrente).
+2. Caricare i market con clobTokenIds per quell’evento.
+3. Mostrare ogni secondo le quote UP e DOWN (e possibilmente bid/ask) per la finestra corrente.
+4. Operare (trading/arbitraggio) solo su quel prodotto.
+
+Oggi il bot si ferma al punto 1: non trova né eventi né market attivi per BTC 5m.
+
+================================================================================

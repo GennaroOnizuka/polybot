@@ -1,0 +1,12 @@
+# Render Blueprint – POLYBOT Background Worker
+# Uso: Dashboard Render → New → Blueprint → collega questo repo.
+# Poi aggiungi manualmente le variabili d'ambiente (Environment) dal tuo .env.
+
+services:
+  - type: worker
+    name: polybot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 bot_async.py
+    # Aggiungi in Dashboard → Environment: PRIVATE_KEY, POLY_SAFE_ADDRESS,
+    # PROXY_URL (o PROXY_*), MONITOR_EVENT_SLUG, SIGNATURE_TYPE, ecc.

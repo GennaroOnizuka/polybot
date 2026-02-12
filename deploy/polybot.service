@@ -1,0 +1,26 @@
+# Systemd unit per POLYBOT (bot_async.py)
+# Installazione:
+#   sudo cp deploy/polybot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable polybot && sudo systemctl start polybot
+#
+# Modifica WorkingDirectory e ExecStart se il progetto è in un path diverso.
+
+[Unit]
+Description=POLYBOT Polymarket Trading Bot (async)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/polybot
+Environment=PATH=/opt/polybot/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/polybot/venv/bin/python3 bot_async.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polybot
+
+[Install]
+WantedBy=multi-user.target

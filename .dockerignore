@@ -1,0 +1,15 @@
+# Non copiare nell'immagine Docker
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+venv
+.venv
+env
+*.log
+*.md
+!README.md
+terminals

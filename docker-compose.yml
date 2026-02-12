@@ -1,0 +1,13 @@
+# POLYBOT - Run perpetuo con restart automatico
+# Uso: docker compose up -d
+# Log: docker compose logs -f
+services:
+  polybot:
+    build: .
+    image: polybot:latest
+    container_name: polybot
+    env_file: .env
+    restart: unless-stopped
+    # Per debug: rimuovi -d e usa stdin_open + tty
+    # stdin_open: true
+    # tty: true
