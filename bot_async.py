@@ -180,6 +180,7 @@ if _get_proxy_url() and not check_proxy_location():
 from data_collector_async import GammaAPIClient, CLOBWebSocketClient
 from strategy import SumToOneArbitrageStrategy, ArbitrageOpportunity
 from executor import OrderExecutor
+from claimer import PositionClaimer
 
 
 def _best_bid_ask(book) -> tuple:
@@ -286,6 +287,18 @@ class PolymarketBot:
             signature_type=self.signature_type
         )
         
+        # Auto-claim: riscatta posizioni vincenti ogni CLAIM_INTERVAL_SECONDS
+        self._claim_interval = int(os.getenv("CLAIM_INTERVAL_SECONDS", "1800"))
+        self._last_claim_ts = 0.0
+        try:
+            self.claimer = PositionClaimer(
+                private_key=self.private_key,
+                proxy_url=_get_proxy_url(),
+            )
+        except Exception as e:
+            print(f"[Auto-Claim] Inizializzazione claimer fallita: {e}")
+            self.claimer = None
+
         # State tracking
         self.running = False
         self.monitored_markets = {}
@@ -572,12 +585,34 @@ class PolymarketBot:
                 print("⚠️  Nessun market 5m trovato per il trigger.")
                 return False
 
-        print(f"\n📈 Quote ogni secondo. Trigger: quando un lato >= {trigger_high:.0%} (e l'altro ~10%), compro il FAVORITO (quello a 90%). Somma quote in [1±{alignment_tol}]. Bet min ~{min_bet_usd}$. Cooldown {cooldown_sec}s. Refresh mercati ogni {refresh_sec}s (nuova finestra 5m).")
+        claim_info = f" Auto-claim ogni {self._claim_interval}s." if self.claimer else ""
+        print(f"\n📈 Quote ogni secondo. Trigger: quando un lato >= {trigger_high:.0%} (e l'altro ~10%), compro il FAVORITO (quello a 90%). Somma quote in [1±{alignment_tol}]. Bet min ~{min_bet_usd}$. Cooldown {cooldown_sec}s. Refresh mercati ogni {refresh_sec}s (nuova finestra 5m).{claim_info}")
         print("=" * 60)
 
         while self.running:
             try:
                 self._tick_proxy_check()
+
+                # ── Auto-claim periodico (ogni CLAIM_INTERVAL_SECONDS, default 30 min) ──
+                now_claim = time.time()
+                if (
+                    self.claimer
+                    and self._claim_interval > 0
+                    and now_claim - self._last_claim_ts >= self._claim_interval
+                ):
+                    self._last_claim_ts = now_claim
+                    try:
+                        print("\n[Auto-Claim] Controllo posizioni riscattabili...")
+                        claimed = await loop.run_in_executor(
+                            None, self.claimer.claim_all
+                        )
+                        if claimed > 0:
+                            print(f"[Auto-Claim] Riscattate {claimed} posizioni.\n")
+                        else:
+                            print("[Auto-Claim] Nessuna posizione da riscattare.\n")
+                    except Exception as e:
+                        print(f"[Auto-Claim] Errore: {e}\n")
+
                 # Refresh periodico: quando finiscono i 5 minuti Gamma espone la nuova finestra; aggiorniamo token
                 if time.time() - last_refresh_ts >= refresh_sec:
                     self._refresh_event_markets()
@@ -646,11 +681,17 @@ class PolymarketBot:
                             await asyncio.sleep(1)
                             continue
 
-                    # Compra al prezzo soglia (trigger_high, es. 0.90), non al prezzo corrente
-                    buy_price = trigger_high
+                    # Compra alla best ask corrente (fill immediato come market order)
+                    # Max price: non comprare sopra 0.95 (margine minimo ~5%)
+                    max_buy_price = float(os.getenv("MAX_BUY_PRICE", "0.95"))
+                    current_price = y if side_label == "UP" else n
+                    if current_price > max_buy_price:
+                        await asyncio.sleep(1)
+                        continue
+                    buy_price = min(max(current_price, trigger_high), max_buy_price)
                     size = max(round(min_bet_usd / buy_price, 2), min_size_quote)
                     usd_approx = size * buy_price
-                    print(f"\n🎯 Trigger: {side_label} ha superato {trigger_high:.0%}. Compro a {buy_price:.2f} (prezzo soglia).")
+                    print(f"\n🎯 Trigger: {side_label} a {current_price:.2f}. Compro a {buy_price:.2f} (max {max_buy_price}).")
                     print(f"   Ordine: BUY {size} quote @ {buy_price:.4f} → ~{usd_approx:.2f}$ (min size CLOB = {min_size_quote})")
                     self._tick_proxy_check()
                     result = await loop.run_in_executor(
