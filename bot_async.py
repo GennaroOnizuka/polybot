@@ -622,7 +622,7 @@ class PolymarketBot:
                     bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "60"))
                     if window_end is not None:
                         secs_left = (window_end - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
-                        if secs_left > bet_window_sec:
+                        if secs_left > bet_window_sec or secs_left <= 0:
                             await asyncio.sleep(1)
                             continue
 
