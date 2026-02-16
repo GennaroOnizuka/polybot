@@ -767,8 +767,8 @@ class PolymarketBot:
                             continue
 
                     # Binance confirmation: BTC deve muoversi nella stessa direzione
-                    # E il delta deve essere >= MIN_BTC_DELTA (default $100) — prezzo troppo vicino = rischio flip
-                    min_btc_delta = float(os.getenv("MIN_BTC_DELTA", "100"))
+                    # E il delta deve essere >= MIN_BTC_DELTA (default $50) — troppo alto = perdi trade validi, troppo basso = rischio flip
+                    min_btc_delta = float(os.getenv("MIN_BTC_DELTA", "50"))
                     if not binance.confirms_direction(side_label, min_delta=min_btc_delta):
                         btc_d, btc_dir_now = binance.get_window_delta()
                         if btc_d is not None and abs(btc_d) < min_btc_delta:
