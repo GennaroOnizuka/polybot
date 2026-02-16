@@ -218,6 +218,10 @@ class OrderExecutor:
         if api_key and api_secret and api_passphrase:
             try:
                 from py_clob_client.clob_types import ApiCreds
+                # Fix base64 padding se mancante
+                pad = len(api_secret) % 4
+                if pad:
+                    api_secret = api_secret + "=" * (4 - pad)
                 self.client.set_api_creds(ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase))
                 print("CLOB: using API credentials from .env")
                 if funder:

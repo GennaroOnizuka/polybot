@@ -564,10 +564,10 @@ class PolymarketBot:
         last_order_ts = None
         last_refresh_ts = time.time()
 
-        yes_token_id, no_token_id, market_label = self._get_current_window_tokens()
+        yes_token_id, no_token_id, market_label, window_end = self._get_current_window_tokens()
         if not yes_token_id or not no_token_id:
             if self._refresh_event_markets():
-                yes_token_id, no_token_id, market_label = self._get_current_window_tokens()
+                yes_token_id, no_token_id, market_label, window_end = self._get_current_window_tokens()
             if not yes_token_id or not no_token_id:
                 print("⚠️  Nessun market 5m trovato per il trigger.")
                 return False
@@ -582,10 +582,10 @@ class PolymarketBot:
                 if time.time() - last_refresh_ts >= refresh_sec:
                     self._refresh_event_markets()
                     last_refresh_ts = time.time()
-                    yes_token_id, no_token_id, market_label = self._get_current_window_tokens()
+                    yes_token_id, no_token_id, market_label, window_end = self._get_current_window_tokens()
                 if not yes_token_id or not no_token_id:
                     if self._refresh_event_markets():
-                        yes_token_id, no_token_id, market_label = self._get_current_window_tokens()
+                        yes_token_id, no_token_id, market_label, window_end = self._get_current_window_tokens()
                     if not yes_token_id or not no_token_id:
                         print("   [Nessun market 5m attivo] Riprovo tra 5s...")
                         await asyncio.sleep(5)
@@ -596,10 +596,13 @@ class PolymarketBot:
                     continue
 
                 import datetime as dt
+                now_utc = dt.datetime.now(dt.timezone.utc)
                 ts = dt.datetime.now().strftime("%H:%M:%S")
                 up_s = f"{yes_price:.2f}" if yes_price is not None else "N/A"
                 down_s = f"{no_price:.2f}" if no_price is not None else "N/A"
-                print(f"[{ts}]  UP {up_s}  DOWN {down_s}")
+                secs_left_display = int((window_end - now_utc).total_seconds()) if window_end else "?"
+                bet_active = "🟢" if (window_end and (window_end - now_utc).total_seconds() <= int(os.getenv("BET_WINDOW_SECONDS", "60"))) else "⏳"
+                print(f"[{ts}]  UP {up_s}  DOWN {down_s}  | {secs_left_display}s alla fine {bet_active}")
 
                 # Allineamento: quote devono sommare ~1 (non 0.90+0.90)
                 y, n = yes_price or 0, no_price or 0
@@ -611,16 +614,23 @@ class PolymarketBot:
                     await asyncio.sleep(1)
                     continue
 
-                # Trigger: un lato >= 90% e l'altro ~10%, quote allineate → compra il FAVORITO (quello a 90%)
+                # Trigger: un lato >= 90% e l'altro ~10%, quote allineate → compra a prezzo soglia (0.90)
+                # Scommessa abilitata SOLO negli ultimi 60 secondi della finestra 5m
                 skip_buy = os.getenv("SKIP_BUY", "1").strip().lower() in ("1", "true", "yes")
                 if not skip_buy:
+                    import datetime as _dt
+                    bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "60"))
+                    if window_end is not None:
+                        secs_left = (window_end - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                        if secs_left > bet_window_sec:
+                            await asyncio.sleep(1)
+                            continue
+
                     if y >= trigger_high and n <= trigger_low:
                         token_id = yes_token_id
-                        price = y
                         side_label = "UP"
                     elif n >= trigger_high and y <= trigger_low:
                         token_id = no_token_id
-                        price = n
                         side_label = "DOWN"
                     else:
                         await asyncio.sleep(1)
@@ -636,10 +646,12 @@ class PolymarketBot:
                             await asyncio.sleep(1)
                             continue
 
-                    size = max(round(min_bet_usd / price, 2), min_size_quote)
-                    usd_approx = size * price
-                    print(f"\n🎯 Trigger: compro il FAVORITO {side_label} a {price:.2%} (altro lato ~{1-price:.0%}). Quote allineate (somma={total:.2f}).")
-                    print(f"   Ordine: BUY {size} quote @ {price:.4f} → ~{usd_approx:.2f}$ (min size CLOB = {min_size_quote})")
+                    # Compra al prezzo soglia (trigger_high, es. 0.90), non al prezzo corrente
+                    buy_price = trigger_high
+                    size = max(round(min_bet_usd / buy_price, 2), min_size_quote)
+                    usd_approx = size * buy_price
+                    print(f"\n🎯 Trigger: {side_label} ha superato {trigger_high:.0%}. Compro a {buy_price:.2f} (prezzo soglia).")
+                    print(f"   Ordine: BUY {size} quote @ {buy_price:.4f} → ~{usd_approx:.2f}$ (min size CLOB = {min_size_quote})")
                     self._tick_proxy_check()
                     result = await loop.run_in_executor(
                         None,
@@ -647,13 +659,13 @@ class PolymarketBot:
                             token_id=token_id,
                             side="BUY",
                             size=size,
-                            price=price,
+                            price=buy_price,
                             post_only=False,
                         ),
                     )
                     if result:
                         last_order_ts = time.time()
-                        print(f"✅ Ordine piazzato. Prossimo ordine possibile tra {cooldown_sec}s.")
+                        print(f"✅ Ordine piazzato. Cooldown {cooldown_sec}s, poi continuo a monitorare.")
                     else:
                         print("❌ Ordine fallito. Continuo a monitorare.")
             except Exception as e:
@@ -662,7 +674,7 @@ class PolymarketBot:
         return False
 
     def _get_current_window_tokens(self):
-        """Ritorna (yes_token_id, no_token_id, market_label) per la finestra 5m corrente."""
+        """Ritorna (yes_token_id, no_token_id, market_label, end_dt) per la finestra 5m corrente."""
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         event_slug = os.getenv("MONITOR_EVENT_SLUG", "btc-updown-5m")
@@ -688,10 +700,10 @@ class PolymarketBot:
         if not candidates:
             for tid in self.token_to_market_map:
                 yes_t, no_t, _ = self.token_to_market_map[tid]
-                return (yes_t, no_t, "")
+                return (yes_t, no_t, "", None)
         candidates.sort(key=lambda x: x[0])
-        _, yes_t, no_t, q = candidates[0]
-        return (yes_t, no_t, (q[:50] + "...") if len(q) > 50 else q)
+        end_dt, yes_t, no_t, q = candidates[0]
+        return (yes_t, no_t, (q[:50] + "...") if len(q) > 50 else q, end_dt)
 
     async def _get_up_down_prices(self, loop, yes_token_id: str, no_token_id: str):
         """Ritorna (yes_price, no_price) da orderbook poi midpoint."""
@@ -988,14 +1000,11 @@ class PolymarketBot:
                 print("⚠️  No token IDs found in markets. Exiting.")
                 return
 
-            # Modalità singola scommessa: 1$ sul lato con quota più alta, poi stop
-            # Default: una bet da 1$ e stop. Con SINGLE_BET=0 si fa monitoraggio continuo.
-            single_bet = os.getenv("SINGLE_BET", "1").strip().lower() in ("1", "true", "yes")
-            if single_bet:
-                await self._run_single_bet()
-                return
+            # Usa sempre il loop di monitoraggio + trigger (quote ogni secondo, compra a 0.90)
+            await self._run_quote_and_trigger_loop()
+            return
             
-            # Initialize WebSocket client
+            # Initialize WebSocket client (codice legacy, non usato)
             self.ws_client = CLOBWebSocketClient(on_message_callback=self._handle_ws_message)
             
             # Start WebSocket in background task
