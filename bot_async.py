@@ -563,16 +563,16 @@ class PolymarketBot:
         Monitora quote UP/DOWN ogni secondo. Quando una quota arriva >= 90% e l'altra è ~10%,
         e le quote sono allineate (somma ~1.0), compra il lato a ~10% con bet minima (~1$).
         """
-        # Soglie da .env (default: compra il lato a ~10% quando l'altro è >= 90%)
-        trigger_high = float(os.getenv("TRIGGER_HIGH_PCT", "90")) / 100.0   # es. 0.90
-        trigger_low = float(os.getenv("TRIGGER_LOW_PCT", "12")) / 100.0      # es. 0.12
+        # Soglie da .env (default: compra il lato favorito quando è >= 92%)
+        trigger_high = float(os.getenv("TRIGGER_HIGH_PCT", "92")) / 100.0   # es. 0.92
+        trigger_low = float(os.getenv("TRIGGER_LOW_PCT", "10")) / 100.0      # es. 0.10
         alignment_tol = float(os.getenv("ALIGNMENT_TOL", "0.05"))            # somma in [1-tol, 1+tol]
         min_bet_usd = float(os.getenv("MIN_BET_USD", "1.0"))
         min_size_quote = float(os.getenv("MIN_ORDER_SIZE_QUOTE", "5"))       # CLOB richiede size >= 5
 
         import time
         loop = asyncio.get_event_loop()
-        cooldown_sec = int(os.getenv("COOLDOWN_SECONDS", "120"))
+        cooldown_sec = int(os.getenv("COOLDOWN_SECONDS", "300"))
         refresh_sec = int(os.getenv("REFRESH_MARKETS_SECONDS", "90"))  # refetch mercati 5m ogni N secondi (nuova finestra)
         last_order_ts = None
         last_refresh_ts = time.time()
@@ -586,7 +586,9 @@ class PolymarketBot:
                 return False
 
         claim_info = f" Auto-claim ogni {self._claim_interval}s." if self.claimer else ""
-        print(f"\n📈 Quote ogni secondo. Trigger: quando un lato >= {trigger_high:.0%} (e l'altro ~10%), compro il FAVORITO (quello a 90%). Somma quote in [1±{alignment_tol}]. Bet min ~{min_bet_usd}$. Cooldown {cooldown_sec}s. Refresh mercati ogni {refresh_sec}s (nuova finestra 5m).{claim_info}")
+        max_buy_price = float(os.getenv("MAX_BUY_PRICE", "0.95"))
+        bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "180"))
+        print(f"\n📈 Quote ogni secondo. Trigger: un lato >= {trigger_high:.0%} (alta convinzione). Max buy: {max_buy_price}. Finestra: ultimi {bet_window_sec}s. Cooldown {cooldown_sec}s. Refresh ogni {refresh_sec}s.{claim_info}")
         print("=" * 60)
 
         while self.running:
@@ -636,7 +638,7 @@ class PolymarketBot:
                 up_s = f"{yes_price:.2f}" if yes_price is not None else "N/A"
                 down_s = f"{no_price:.2f}" if no_price is not None else "N/A"
                 secs_left_display = int((window_end - now_utc).total_seconds()) if window_end else "?"
-                bet_active = "🟢" if (window_end and (window_end - now_utc).total_seconds() <= int(os.getenv("BET_WINDOW_SECONDS", "60"))) else "⏳"
+                bet_active = "🟢" if (window_end and 0 < (window_end - now_utc).total_seconds() <= int(os.getenv("BET_WINDOW_SECONDS", "180"))) else "⏳"
                 print(f"[{ts}]  UP {up_s}  DOWN {down_s}  | {secs_left_display}s alla fine {bet_active}")
 
                 # Allineamento: quote devono sommare ~1 (non 0.90+0.90)
@@ -649,12 +651,12 @@ class PolymarketBot:
                     await asyncio.sleep(1)
                     continue
 
-                # Trigger: un lato >= 90% e l'altro ~10%, quote allineate → compra a prezzo soglia (0.90)
-                # Scommessa abilitata SOLO negli ultimi 60 secondi della finestra 5m
+                # Trigger: un lato >= 92% e l'altro ~8%, quote allineate → compra a prezzo corrente
+                # Scommessa abilitata negli ultimi BET_WINDOW_SECONDS della finestra 5m
                 skip_buy = os.getenv("SKIP_BUY", "1").strip().lower() in ("1", "true", "yes")
                 if not skip_buy:
                     import datetime as _dt
-                    bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "60"))
+                    bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "180"))
                     if window_end is not None:
                         secs_left = (window_end - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
                         if secs_left > bet_window_sec or secs_left <= 0:
