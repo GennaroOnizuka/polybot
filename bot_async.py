@@ -778,19 +778,28 @@ class PolymarketBot:
                         await asyncio.sleep(1)
                         continue
 
-                    # Price check
+                    # Price check (midpoint per trigger)
                     current_price = y if side_label == "UP" else n
                     if current_price > max_buy_price:
                         await asyncio.sleep(1)
                         continue
 
-                    buy_price = min(max(current_price, trigger_high), max_buy_price)
+                    # Prezzo ordine = BEST ASK (fill immediato). Se piazziamo al midpoint non filliamo.
+                    book = await loop.run_in_executor(None, self.executor.get_orderbook, token_id)
+                    best_ask = _best_ask_float(book) if book else None
+                    if best_ask is not None:
+                        # Leggero buffer sopra best_ask per fill immediato (latenza fetch → invio)
+                        buy_price = min(round(best_ask + 0.01, 2), max_buy_price)
+                    else:
+                        buy_price = min(max(current_price, trigger_high), max_buy_price)
+
+                    buy_price = round(buy_price, 2)
                     size = max(round(min_bet_usd / buy_price, 2), current_size)
                     usd_approx = size * buy_price
 
                     btc_d, btc_dir_now = binance.get_window_delta()
                     btc_conf = f"BTC {btc_dir_now} Δ${btc_d:+.0f}" if btc_d is not None else "BTC N/A"
-                    print(f"\n🎯 Trigger: {side_label} a {current_price:.2f}. {btc_conf}. Compro a {buy_price:.2f} (max {max_buy_price}).")
+                    print(f"\n🎯 Trigger: {side_label} a {current_price:.2f}. {btc_conf}. Compro a best_ask {buy_price:.2f} (max {max_buy_price}).")
                     print(f"   Ordine: BUY {size} shares @ {buy_price:.4f} → ~{usd_approx:.2f}$")
                     self._tick_proxy_check()
                     result = await loop.run_in_executor(
