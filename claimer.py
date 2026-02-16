@@ -113,6 +113,10 @@ class PositionClaimer:
     Works with email/Magic Link accounts (signature_type=1) via proxy factory.
     """
 
+    # Grace period after a successful claim before trying again (seconds).
+    # Gives the data API time to reflect the new state.
+    GRACE_AFTER_CLAIM = 300  # 5 minutes
+
     def __init__(self, private_key: str, proxy_url: str = ""):
         pk = private_key.strip()
         if not pk.startswith("0x"):
@@ -120,6 +124,11 @@ class PositionClaimer:
         self.account = Account.from_key(pk)
         self.eoa_address = self.account.address
         self.proxy_url = proxy_url
+
+        # Track already-claimed condition IDs to avoid re-processing
+        self._claimed_conditions: set = set()
+        # Timestamp until which we skip claim attempts (grace period)
+        self._skip_until: float = 0.0
 
         # Web3 setup (Polygon PoA chain) — custom RPC or fallback
         rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
@@ -170,17 +179,20 @@ class PositionClaimer:
             self.eoa_address
         ).call()
 
-    def _rpc_call_with_retry(self, fn, max_retries=3):
-        """Execute an RPC call with retry on rate limit."""
+    def _rpc_call_with_retry(self, fn, max_retries=5):
+        """Execute an RPC call with retry on rate limit (exponential backoff)."""
         for attempt in range(max_retries):
             try:
                 return fn()
             except Exception as e:
-                if "rate limit" in str(e).lower() or "too many" in str(e).lower():
-                    wait = 5 * (attempt + 1)
+                err_msg = str(e).lower()
+                if "rate limit" in err_msg or "too many" in err_msg:
+                    wait = min(10 * (2 ** attempt), 60)  # 10s, 20s, 40s, 60s, 60s
+                    print(f"[Claimer] RPC rate limit, riprovo tra {wait}s... (tentativo {attempt+1}/{max_retries})")
                     time.sleep(wait)
                     continue
                 raise
+        # Final attempt — let it raise if it fails
         return fn()
 
     def _get_onchain_balance(self, token_id: str) -> float:
@@ -253,12 +265,15 @@ class PositionClaimer:
         if not proxy_calls:
             return None
 
-        # Build the proxy factory transaction (with RPC retry)
+        # Stagger RPC calls to avoid rate limits on public endpoints
         nonce = self._rpc_call_with_retry(
             lambda: self.w3.eth.get_transaction_count(self.eoa_address)
         )
+        time.sleep(2)
+
         gas_price = self._rpc_call_with_retry(lambda: self.w3.eth.gas_price)
         adjusted_gas_price = int(gas_price * 1.1)
+        time.sleep(2)
 
         tx = self.proxy_factory.functions.proxy(
             proxy_calls
@@ -271,7 +286,8 @@ class PositionClaimer:
             }
         )
 
-        # Estimate gas
+        # Estimate gas (with delay before the call)
+        time.sleep(2)
         try:
             estimated = self._rpc_call_with_retry(
                 lambda: self.w3.eth.estimate_gas(tx)
@@ -336,7 +352,15 @@ class PositionClaimer:
         """
         Find and claim ALL redeemable positions in a SINGLE transaction.
         Returns number of positions claimed.
+        Skips positions already claimed in previous runs (grace period).
         """
+        # Grace period: skip if we just claimed recently
+        now = time.time()
+        if now < self._skip_until:
+            remaining = int(self._skip_until - now)
+            print(f"[Claimer] Grace period attivo, salto (riprovo tra {remaining}s).")
+            return 0
+
         positions = self.get_redeemable_positions()
         if not positions:
             print("[Claimer] Nessuna posizione da riscattare.")
@@ -355,13 +379,20 @@ class PositionClaimer:
                 continue
             seen_conditions.add(condition_id)
 
+            # Skip conditions already claimed in a previous run
+            if condition_id in self._claimed_conditions:
+                continue
+
             token_id = pos.get("asset", "")
             if not token_id:
                 continue
 
-            # Verify actual on-chain balance
+            # Verify actual on-chain balance (with small delay to avoid RPC flooding)
+            time.sleep(1)
             onchain_bal = self._get_onchain_balance(token_id)
             if onchain_bal < 0.01:
+                # No real balance → mark as already claimed / empty
+                self._claimed_conditions.add(condition_id)
                 continue
 
             neg_risk = pos.get("negativeRisk", False)
@@ -387,9 +418,20 @@ class PositionClaimer:
         for lbl in labels:
             print(lbl)
 
+        # Small delay before the heavy RPC batch to space out calls
+        time.sleep(3)
+
         tx = self._send_batch_tx(proxy_calls)
         if tx:
             print(f"[Claimer] Tutte {len(proxy_calls)} posizioni riscattate!")
+            # Mark these conditions as claimed → skip on next run
+            for pos in positions:
+                cid = pos.get("conditionId", "")
+                if cid:
+                    self._claimed_conditions.add(cid)
+            # Activate grace period so the API has time to update
+            self._skip_until = time.time() + self.GRACE_AFTER_CLAIM
+            print(f"[Claimer] Grace period: prossimo tentativo tra {self.GRACE_AFTER_CLAIM}s.")
             return len(proxy_calls)
         return 0
 
