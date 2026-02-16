@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
+from binance_feed import BinanceFeed
+
 # Logging: utile per verificare che le richieste passino dal proxy
 _log = logging.getLogger("polybot")
 if os.getenv("POLYBOT_DEBUG_PROXY"):
@@ -560,22 +562,43 @@ class PolymarketBot:
 
     async def _run_quote_and_trigger_loop(self) -> bool:
         """
-        Monitora quote UP/DOWN ogni secondo. Quando una quota arriva >= 90% e l'altra è ~10%,
-        e le quote sono allineate (somma ~1.0), compra il lato a ~10% con bet minima (~1$).
+        Monitora quote UP/DOWN ogni secondo con prezzo BTC Binance.
+        Trigger: un lato >= 92%, confermato da Binance.
+        Martingala soft: dopo una perdita, 2 trade a 8 shares, poi torna a 5.
         """
-        # Soglie da .env (default: compra il lato favorito quando è >= 92%)
-        trigger_high = float(os.getenv("TRIGGER_HIGH_PCT", "92")) / 100.0   # es. 0.92
-        trigger_low = float(os.getenv("TRIGGER_LOW_PCT", "10")) / 100.0      # es. 0.10
-        alignment_tol = float(os.getenv("ALIGNMENT_TOL", "0.05"))            # somma in [1-tol, 1+tol]
+        trigger_high = float(os.getenv("TRIGGER_HIGH_PCT", "92")) / 100.0
+        trigger_low = float(os.getenv("TRIGGER_LOW_PCT", "10")) / 100.0
+        alignment_tol = float(os.getenv("ALIGNMENT_TOL", "0.05"))
         min_bet_usd = float(os.getenv("MIN_BET_USD", "1.0"))
-        min_size_quote = float(os.getenv("MIN_ORDER_SIZE_QUOTE", "5"))       # CLOB richiede size >= 5
+        base_size = float(os.getenv("MIN_ORDER_SIZE_QUOTE", "5"))
+        recovery_size = float(os.getenv("RECOVERY_SIZE_QUOTE", "8"))
 
         import time
+        import datetime as dt
         loop = asyncio.get_event_loop()
         cooldown_sec = int(os.getenv("COOLDOWN_SECONDS", "300"))
-        refresh_sec = int(os.getenv("REFRESH_MARKETS_SECONDS", "90"))  # refetch mercati 5m ogni N secondi (nuova finestra)
+        refresh_sec = int(os.getenv("REFRESH_MARKETS_SECONDS", "90"))
+        max_buy_price = float(os.getenv("MAX_BUY_PRICE", "0.95"))
+        bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "180"))
+
         last_order_ts = None
         last_refresh_ts = time.time()
+
+        # ── Binance BTC feed ──
+        binance = BinanceFeed()
+        btc_start_price = binance.get_btc_price()
+        if btc_start_price:
+            print(f"[Binance] BTC/USDT: ${btc_start_price:,.2f}")
+
+        # ── Martingala soft: tracking ──
+        current_size = base_size
+        recovery_trades_left = 0  # quanti trade a recovery_size restano
+        last_bet_side = None      # "UP" o "DOWN" — il lato su cui abbiamo scommesso
+        last_bet_window_end = None  # quando finisce la finestra della scommessa
+        win_loss_checked = True   # True se abbiamo già verificato l'esito
+        total_wins = 0
+        total_losses = 0
+        session_pnl = 0.0
 
         yes_token_id, no_token_id, market_label, window_end = self._get_current_window_tokens()
         if not yes_token_id or not no_token_id:
@@ -585,17 +608,22 @@ class PolymarketBot:
                 print("⚠️  Nessun market 5m trovato per il trigger.")
                 return False
 
+        # Set Binance window start price
+        if window_end:
+            binance.set_window_from_end_datetime(window_end)
+
         claim_info = f" Auto-claim ogni {self._claim_interval}s." if self.claimer else ""
-        max_buy_price = float(os.getenv("MAX_BUY_PRICE", "0.95"))
-        bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "180"))
-        print(f"\n📈 Quote ogni secondo. Trigger: un lato >= {trigger_high:.0%} (alta convinzione). Max buy: {max_buy_price}. Finestra: ultimi {bet_window_sec}s. Cooldown {cooldown_sec}s. Refresh ogni {refresh_sec}s.{claim_info}")
-        print("=" * 60)
+        size_info = f"Size: {base_size} (recovery: {recovery_size}×2)."
+        print(f"\n📈 Trigger: >= {trigger_high:.0%} + Binance. Max buy: {max_buy_price}. Finestra: ultimi {bet_window_sec}s. Cooldown {cooldown_sec}s. {size_info}{claim_info}")
+        print("=" * 80)
+
+        prev_window_end = window_end
 
         while self.running:
             try:
                 self._tick_proxy_check()
 
-                # ── Auto-claim periodico (ogni CLAIM_INTERVAL_SECONDS, default 30 min) ──
+                # ── Auto-claim periodico ──
                 now_claim = time.time()
                 if (
                     self.claimer
@@ -615,7 +643,7 @@ class PolymarketBot:
                     except Exception as e:
                         print(f"[Auto-Claim] Errore: {e}\n")
 
-                # Refresh periodico: quando finiscono i 5 minuti Gamma espone la nuova finestra; aggiorniamo token
+                # ── Refresh mercati ──
                 if time.time() - last_refresh_ts >= refresh_sec:
                     self._refresh_event_markets()
                     last_refresh_ts = time.time()
@@ -627,21 +655,79 @@ class PolymarketBot:
                         print("   [Nessun market 5m attivo] Riprovo tra 5s...")
                         await asyncio.sleep(5)
                         continue
+
+                # ── Nuova finestra? Aggiorna prezzo BTC di riferimento ──
+                if window_end and window_end != prev_window_end:
+                    binance.set_window_from_end_datetime(window_end)
+                    prev_window_end = window_end
+
+                # ── Win/loss detection: dopo la fine della finestra in cui abbiamo scommesso ──
+                if (
+                    not win_loss_checked
+                    and last_bet_window_end is not None
+                    and last_bet_side is not None
+                ):
+                    now_utc_check = dt.datetime.now(dt.timezone.utc)
+                    secs_since_end = (now_utc_check - last_bet_window_end).total_seconds()
+                    if secs_since_end >= 3:  # aspetta 3s dopo la fine per dati stabili
+                        btc_delta, btc_dir = binance.get_window_delta()
+                        if btc_dir is not None:
+                            won = (btc_dir == last_bet_side)
+                            win_loss_checked = True
+                            if won:
+                                total_wins += 1
+                                profit_est = (1.0 - trigger_high) * current_size
+                                session_pnl += profit_est
+                                print(f"\n   ✅ WIN! BTC went {btc_dir} (Δ${btc_delta:+.1f}). Bet was {last_bet_side}.")
+                                if recovery_trades_left > 0:
+                                    recovery_trades_left -= 1
+                                    if recovery_trades_left == 0:
+                                        current_size = base_size
+                                        print(f"   [Martingala] Recovery completata! Torno a {base_size} shares.")
+                                    else:
+                                        print(f"   [Martingala] Recovery: ancora {recovery_trades_left} trade a {recovery_size} shares.")
+                            else:
+                                total_losses += 1
+                                loss_est = trigger_high * current_size
+                                session_pnl -= loss_est
+                                print(f"\n   ❌ LOSS! BTC went {btc_dir} (Δ${btc_delta:+.1f}). Bet was {last_bet_side}.")
+                                recovery_trades_left = 2
+                                current_size = recovery_size
+                                print(f"   [Martingala] Prossimi 2 trade a {recovery_size} shares per recupero.")
+                            print(f"   [Session] W:{total_wins} L:{total_losses} PnL:${session_pnl:+.2f} | Size corrente: {current_size}")
+
+                # ── Fetch prezzi Polymarket ──
                 yes_price, no_price = await self._get_up_down_prices(loop, yes_token_id, no_token_id)
                 if yes_price is None and no_price is None:
                     await asyncio.sleep(1)
                     continue
 
-                import datetime as dt
+                # ── Display con BTC price ──
                 now_utc = dt.datetime.now(dt.timezone.utc)
                 ts = dt.datetime.now().strftime("%H:%M:%S")
                 up_s = f"{yes_price:.2f}" if yes_price is not None else "N/A"
                 down_s = f"{no_price:.2f}" if no_price is not None else "N/A"
                 secs_left_display = int((window_end - now_utc).total_seconds()) if window_end else "?"
-                bet_active = "🟢" if (window_end and 0 < (window_end - now_utc).total_seconds() <= int(os.getenv("BET_WINDOW_SECONDS", "180"))) else "⏳"
-                print(f"[{ts}]  UP {up_s}  DOWN {down_s}  | {secs_left_display}s alla fine {bet_active}")
+                bet_active = "🟢" if (window_end and 0 < (window_end - now_utc).total_seconds() <= bet_window_sec) else "⏳"
 
-                # Allineamento: quote devono sommare ~1 (non 0.90+0.90)
+                btc_delta, btc_dir = binance.get_window_delta()
+                btc_price = binance.get_btc_price()
+                beat_price = binance.get_window_start_price()
+                btc_str = ""
+                if btc_price is not None:
+                    if beat_price is not None and btc_delta is not None:
+                        arrow = "▲" if btc_delta >= 0 else "▼"
+                        btc_str = f" | Beat ${beat_price:,.2f} → Now ${btc_price:,.2f} {arrow}${abs(btc_delta):.0f}"
+                    elif btc_delta is not None:
+                        arrow = "▲" if btc_delta >= 0 else "▼"
+                        btc_str = f" | BTC ${btc_price:,.2f} {arrow}${abs(btc_delta):.0f}"
+                    else:
+                        btc_str = f" | BTC ${btc_price:,.2f}"
+
+                size_tag = f" [R{recovery_trades_left}]" if recovery_trades_left > 0 else ""
+                print(f"[{ts}]  UP {up_s}  DOWN {down_s}  | {secs_left_display}s {bet_active}{btc_str}{size_tag}")
+
+                # ── Allineamento ──
                 y, n = yes_price or 0, no_price or 0
                 if y <= 0 or n <= 0:
                     await asyncio.sleep(1)
@@ -651,14 +737,11 @@ class PolymarketBot:
                     await asyncio.sleep(1)
                     continue
 
-                # Trigger: un lato >= 92% e l'altro ~8%, quote allineate → compra a prezzo corrente
-                # Scommessa abilitata negli ultimi BET_WINDOW_SECONDS della finestra 5m
+                # ── Trading logic ──
                 skip_buy = os.getenv("SKIP_BUY", "1").strip().lower() in ("1", "true", "yes")
                 if not skip_buy:
-                    import datetime as _dt
-                    bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "180"))
                     if window_end is not None:
-                        secs_left = (window_end - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                        secs_left = (window_end - dt.datetime.now(dt.timezone.utc)).total_seconds()
                         if secs_left > bet_window_sec or secs_left <= 0:
                             await asyncio.sleep(1)
                             continue
@@ -673,28 +756,42 @@ class PolymarketBot:
                         await asyncio.sleep(1)
                         continue
 
-                    # Per almeno cooldown_sec secondi dopo l'ultimo ordine: SOLO quote, nessun ordine
+                    # Cooldown
                     now_ts = time.time()
                     if last_order_ts is not None:
                         elapsed = now_ts - last_order_ts
                         if elapsed <= cooldown_sec:
                             remaining = int(cooldown_sec - elapsed) + 1
-                            print(f"   [Cooldown] Solo quote per altri {remaining}s, nessun ordine.")
+                            print(f"   [Cooldown] {remaining}s restanti.")
                             await asyncio.sleep(1)
                             continue
 
-                    # Compra alla best ask corrente (fill immediato come market order)
-                    # Max price: non comprare sopra 0.95 (margine minimo ~5%)
-                    max_buy_price = float(os.getenv("MAX_BUY_PRICE", "0.95"))
+                    # Binance confirmation: BTC deve muoversi nella stessa direzione
+                    # E il delta deve essere >= MIN_BTC_DELTA (default $100) — prezzo troppo vicino = rischio flip
+                    min_btc_delta = float(os.getenv("MIN_BTC_DELTA", "100"))
+                    if not binance.confirms_direction(side_label, min_delta=min_btc_delta):
+                        btc_d, btc_dir_now = binance.get_window_delta()
+                        if btc_d is not None and abs(btc_d) < min_btc_delta:
+                            print(f"   [Binance] BTC Δ${btc_d:+.0f} troppo vicino (min ${min_btc_delta:.0f}). SKIP — rischio flip.")
+                        else:
+                            print(f"   [Binance] BTC dice {btc_dir_now} (Δ${btc_d:+.0f}), Polymarket dice {side_label}. SKIP — no conferma.")
+                        await asyncio.sleep(1)
+                        continue
+
+                    # Price check
                     current_price = y if side_label == "UP" else n
                     if current_price > max_buy_price:
                         await asyncio.sleep(1)
                         continue
+
                     buy_price = min(max(current_price, trigger_high), max_buy_price)
-                    size = max(round(min_bet_usd / buy_price, 2), min_size_quote)
+                    size = max(round(min_bet_usd / buy_price, 2), current_size)
                     usd_approx = size * buy_price
-                    print(f"\n🎯 Trigger: {side_label} a {current_price:.2f}. Compro a {buy_price:.2f} (max {max_buy_price}).")
-                    print(f"   Ordine: BUY {size} quote @ {buy_price:.4f} → ~{usd_approx:.2f}$ (min size CLOB = {min_size_quote})")
+
+                    btc_d, btc_dir_now = binance.get_window_delta()
+                    btc_conf = f"BTC {btc_dir_now} Δ${btc_d:+.0f}" if btc_d is not None else "BTC N/A"
+                    print(f"\n🎯 Trigger: {side_label} a {current_price:.2f}. {btc_conf}. Compro a {buy_price:.2f} (max {max_buy_price}).")
+                    print(f"   Ordine: BUY {size} shares @ {buy_price:.4f} → ~{usd_approx:.2f}$")
                     self._tick_proxy_check()
                     result = await loop.run_in_executor(
                         None,
@@ -708,12 +805,17 @@ class PolymarketBot:
                     )
                     if result:
                         last_order_ts = time.time()
-                        print(f"✅ Ordine piazzato. Cooldown {cooldown_sec}s, poi continuo a monitorare.")
+                        last_bet_side = side_label
+                        last_bet_window_end = window_end
+                        win_loss_checked = False
+                        print(f"✅ Ordine piazzato ({size} shares). Cooldown {cooldown_sec}s.")
                     else:
                         print("❌ Ordine fallito. Continuo a monitorare.")
             except Exception as e:
                 print(f"\n⚠️  Errore: {e}")
             await asyncio.sleep(1)
+
+        binance.close()
         return False
 
     def _get_current_window_tokens(self):
