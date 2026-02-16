@@ -670,7 +670,11 @@ class PolymarketBot:
                     now_utc_check = dt.datetime.now(dt.timezone.utc)
                     secs_since_end = (now_utc_check - last_bet_window_end).total_seconds()
                     if secs_since_end >= 3:  # aspetta 3s dopo la fine per dati stabili
+                        # Usa la finestra della scommessa, non quella corrente (altrimenti delta sbagliato → martingala non parte)
+                        binance.set_window_from_end_datetime(last_bet_window_end)
                         btc_delta, btc_dir = binance.get_window_delta()
+                        if window_end:
+                            binance.set_window_from_end_datetime(window_end)  # ripristina finestra corrente
                         if btc_dir is not None:
                             won = (btc_dir == last_bet_side)
                             win_loss_checked = True
@@ -788,6 +792,11 @@ class PolymarketBot:
                     book = await loop.run_in_executor(None, self.executor.get_orderbook, token_id)
                     best_ask = _best_ask_float(book) if book else None
                     if best_ask is not None:
+                        # Sicurezza: stiamo comprando il lato "forte" (>=92%), best_ask non può essere basso (es. 0.35)
+                        if best_ask < 0.50:
+                            print(f"   [SKIP] Best ask {best_ask:.2f} sospetto per {side_label} a {current_price:.2f} — possibile token/orderbook sbagliato.")
+                            await asyncio.sleep(1)
+                            continue
                         # Leggero buffer sopra best_ask per fill immediato (latenza fetch → invio)
                         buy_price = min(round(best_ask + 0.01, 2), max_buy_price)
                     else:
