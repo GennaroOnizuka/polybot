@@ -133,15 +133,16 @@ class PositionClaimer:
         # Web3 setup (Polygon PoA chain) — custom RPC or fallback con retry su RPC alternativi
         rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
         rpc_options = [rpc_url]
-        # RPC alternativi se quello principale fallisce
-        if rpc_url == "https://polygon-rpc.com" or not rpc_url:
-            rpc_options.extend([
-                "https://polygon.drpc.org",
-                "https://polygon-public.nodies.app",
-                "https://1rpc.io/matic",
-                "https://polygon.api.onfinality.io/public",
-                "https://polygon-mainnet.gateway.tatum.io",
-            ])
+        fallback_rpcs = [
+            "https://polygon.drpc.org",
+            "https://polygon-public.nodies.app",
+            "https://1rpc.io/matic",
+            "https://polygon.api.onfinality.io/public",
+            "https://polygon-mainnet.gateway.tatum.io",
+        ]
+        for fb in fallback_rpcs:
+            if fb != rpc_url:
+                rpc_options.append(fb)
         
         self.w3 = None
         for rpc in rpc_options:
