@@ -564,17 +564,12 @@ class PolymarketBot:
         """
         Monitora quote UP/DOWN ogni secondo con prezzo BTC Binance.
         Trigger: un lato >= 92%, confermato da Binance.
-        Martingala: dopo 3 L consecutive, 3 trade a 10 shares (edge 100), poi torna a base (5 shares, edge 70).
         """
         trigger_high = float(os.getenv("TRIGGER_HIGH_PCT", "92")) / 100.0
         trigger_low = float(os.getenv("TRIGGER_LOW_PCT", "10")) / 100.0
         alignment_tol = float(os.getenv("ALIGNMENT_TOL", "0.05"))
         min_bet_usd = float(os.getenv("MIN_BET_USD", "1.0"))
-        base_size = float(os.getenv("MIN_ORDER_SIZE_QUOTE", "5"))
-        recovery_size = float(os.getenv("RECOVERY_SIZE_QUOTE", "10"))
-        recovery_trades_count = int(os.getenv("RECOVERY_TRADES_COUNT", "3"))
-        base_edge = float(os.getenv("BASE_EDGE", "70"))  # MIN_BTC_DELTA per base
-        recovery_edge = float(os.getenv("RECOVERY_EDGE", "100"))  # MIN_BTC_DELTA durante recovery
+        base_size = float(os.getenv("MIN_ORDER_SIZE_QUOTE", "10"))
 
         import time
         import datetime as dt
@@ -593,14 +588,10 @@ class PolymarketBot:
         if btc_start_price:
             print(f"[Binance] BTC/USDT: ${btc_start_price:,.2f}")
 
-        # ── Martingala: tracking ──
-        current_size = base_size
-        recovery_trades_left = 0  # quanti trade a recovery_size restano (0 = non in recovery)
-        consecutive_losses = 0    # contatore L consecutive (reset dopo recovery)
-        current_edge = base_edge   # MIN_BTC_DELTA corrente (base o recovery)
-        last_bet_side = None      # "UP" o "DOWN" — il lato su cui abbiamo scommesso
-        last_bet_window_end = None  # quando finisce la finestra della scommessa
-        win_loss_checked = True   # True se abbiamo già verificato l'esito
+        # ── Win/loss tracking (solo statistiche) ──
+        last_bet_side = None
+        last_bet_window_end = None
+        win_loss_checked = True
         total_wins = 0
         total_losses = 0
         session_pnl = 0.0
@@ -618,7 +609,7 @@ class PolymarketBot:
             binance.set_window_from_end_datetime(window_end)
 
         claim_info = f" Auto-claim ogni {self._claim_interval}s." if self.claimer else ""
-        size_info = f"Size: {base_size} (edge {base_edge}), recovery: {recovery_size}×{recovery_trades_count} (edge {recovery_edge}) dopo 3L consecutive."
+        size_info = f"Size: {base_size} shares."
         print(f"\n📈 Trigger: >= {trigger_high:.0%} + Binance. Max buy: {max_buy_price}. Finestra: ultimi {bet_window_sec}s. Cooldown {cooldown_sec}s. {size_info}{claim_info}")
         print("=" * 80)
 
@@ -675,7 +666,7 @@ class PolymarketBot:
                     now_utc_check = dt.datetime.now(dt.timezone.utc)
                     secs_since_end = (now_utc_check - last_bet_window_end).total_seconds()
                     if secs_since_end >= 3:  # aspetta 3s dopo la fine per dati stabili
-                        # Usa la finestra della scommessa, non quella corrente (altrimenti delta sbagliato → martingala non parte)
+                        # Usa la finestra della scommessa, non quella corrente (altrimenti delta sbagliato)
                         binance.set_window_from_end_datetime(last_bet_window_end)
                         btc_delta, btc_dir = binance.get_window_delta()
                         if window_end:
@@ -685,36 +676,15 @@ class PolymarketBot:
                             win_loss_checked = True
                             if won:
                                 total_wins += 1
-                                profit_est = (1.0 - trigger_high) * current_size
+                                profit_est = (1.0 - trigger_high) * base_size
                                 session_pnl += profit_est
                                 print(f"\n   ✅ WIN! BTC went {btc_dir} (Δ${btc_delta:+.1f}). Bet was {last_bet_side}.")
-                                consecutive_losses = 0  # reset contatore L consecutive
-                                if recovery_trades_left > 0:
-                                    # Durante recovery: continua anche se vinci, completa le 3 scommesse
-                                    recovery_trades_left -= 1
-                                    if recovery_trades_left == 0:
-                                        # Recovery completata: torna a base
-                                        current_size = base_size
-                                        current_edge = base_edge
-                                        print(f"   [Martingala] Recovery completata! Torno a {base_size} shares, edge {base_edge}.")
-                                    else:
-                                        print(f"   [Martingala] Recovery: ancora {recovery_trades_left} trade a {recovery_size} shares (edge {recovery_edge}).")
                             else:
                                 total_losses += 1
-                                loss_est = trigger_high * current_size
+                                loss_est = trigger_high * base_size
                                 session_pnl -= loss_est
-                                consecutive_losses += 1
-                                print(f"\n   ❌ LOSS! BTC went {btc_dir} (Δ${btc_delta:+.1f}). Bet was {last_bet_side}. L consecutive: {consecutive_losses}")
-                                if consecutive_losses >= 3 and recovery_trades_left == 0:
-                                    # Attiva recovery: 3 trade a 10 shares con edge 100
-                                    recovery_trades_left = recovery_trades_count
-                                    current_size = recovery_size
-                                    current_edge = recovery_edge
-                                    print(f"   [Martingala] 3 L consecutive! Attivo recovery: {recovery_trades_count} trade a {recovery_size} shares (edge {recovery_edge}).")
-                                elif recovery_trades_left > 0:
-                                    # Durante recovery: se perdi, continua comunque fino a completare le 3
-                                    print(f"   [Martingala] L durante recovery. Continuo: ancora {recovery_trades_left} trade a {recovery_size} shares.")
-                            print(f"   [Session] W:{total_wins} L:{total_losses} PnL:${session_pnl:+.2f} | Size: {current_size} | Edge: {current_edge} | L consecutive: {consecutive_losses}")
+                                print(f"\n   ❌ LOSS! BTC went {btc_dir} (Δ${btc_delta:+.1f}). Bet was {last_bet_side}.")
+                            print(f"   [Session] W:{total_wins} L:{total_losses} PnL:${session_pnl:+.2f}")
 
                 # ── Fetch prezzi Polymarket ──
                 yes_price, no_price = await self._get_up_down_prices(loop, yes_token_id, no_token_id)
@@ -744,8 +714,7 @@ class PolymarketBot:
                     else:
                         btc_str = f" | BTC ${btc_price:,.2f}"
 
-                size_tag = f" [R{recovery_trades_left}]" if recovery_trades_left > 0 else ""
-                print(f"[{ts}]  UP {up_s}  DOWN {down_s}  | {secs_left_display}s {bet_active}{btc_str}{size_tag}")
+                print(f"[{ts}]  UP {up_s}  DOWN {down_s}  | {secs_left_display}s {bet_active}{btc_str}")
 
                 # ── Allineamento ──
                 y, n = yes_price or 0, no_price or 0
@@ -787,8 +756,7 @@ class PolymarketBot:
                             continue
 
                     # Binance confirmation: BTC deve muoversi nella stessa direzione
-                    # Edge dinamico: base_edge (70) o recovery_edge (100) durante recovery
-                    min_btc_delta = current_edge
+                    min_btc_delta = float(os.getenv("MIN_BTC_DELTA", "100"))
                     if not binance.confirms_direction(side_label, min_delta=min_btc_delta):
                         btc_d, btc_dir_now = binance.get_window_delta()
                         if btc_d is not None and abs(btc_d) < min_btc_delta:
@@ -819,7 +787,7 @@ class PolymarketBot:
                         buy_price = min(max(current_price, trigger_high), max_buy_price)
 
                     buy_price = round(buy_price, 2)
-                    size = max(round(min_bet_usd / buy_price, 2), current_size)
+                    size = max(round(min_bet_usd / buy_price, 2), base_size)
                     usd_approx = size * buy_price
 
                     btc_d, btc_dir_now = binance.get_window_delta()
