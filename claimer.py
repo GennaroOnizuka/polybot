@@ -367,6 +367,9 @@ class PositionClaimer:
             return 0
 
         print(f"[Claimer] API: {len(positions)} posizioni redeemable. Verifico on-chain...")
+        total_api_size = sum(float(p.get("size", 0) or 0) for p in positions)
+        if total_api_size > 0:
+            print(f"[Claimer] Totale size dall'API: {total_api_size:.2f} USDC")
 
         # Build list of proxy calls (one per real position)
         proxy_calls = []
@@ -390,10 +393,20 @@ class PositionClaimer:
             # Verify actual on-chain balance (with small delay to avoid RPC flooding)
             time.sleep(1)
             onchain_bal = self._get_onchain_balance(token_id)
+            
+            # Se l'API dice redeemable ma on-chain è 0, potrebbe essere timing/RPC issue
+            # Usa il valore dall'API come fallback se disponibile
+            api_size = float(pos.get("size", 0) or 0)
             if onchain_bal < 0.01:
-                # No real balance → mark as already claimed / empty
-                self._claimed_conditions.add(condition_id)
-                continue
+                if api_size > 0:
+                    # API dice che c'è saldo ma on-chain check fallisce → usa API value e prova comunque
+                    print(f"[Claimer] Warning: token {token_id[:20]}... on-chain={onchain_bal:.4f} ma API size={api_size:.4f}. Provo comunque.")
+                    onchain_bal = api_size
+                else:
+                    # Nessun saldo né on-chain né API → skip
+                    print(f"[Claimer] Skip: token {token_id[:20]}... saldo 0 (on-chain={onchain_bal:.4f}, API={api_size:.4f})")
+                    self._claimed_conditions.add(condition_id)
+                    continue
 
             neg_risk = pos.get("negativeRisk", False)
             outcome_index = int(pos.get("outcomeIndex", 0))
@@ -412,6 +425,7 @@ class PositionClaimer:
 
         if not proxy_calls:
             print("[Claimer] Nessuna posizione con saldo reale on-chain.")
+            print(f"[Claimer] Debug: {len(positions)} posizioni API, {len(seen_conditions)} condition uniche, {len(proxy_calls)} dopo verifica on-chain.")
             return 0
 
         print(f"[Claimer] {len(proxy_calls)} posizioni da riscattare in 1 transazione:")
