@@ -117,7 +117,7 @@ class PositionClaimer:
     # Gives the data API time to reflect the new state.
     GRACE_AFTER_CLAIM = 300  # 5 minutes
 
-    def __init__(self, private_key: str, proxy_url: str = ""):
+    def __init__(self, private_key: str, proxy_url: str = "", poly_proxy_address: Optional[str] = None):
         pk = private_key.strip()
         if not pk.startswith("0x"):
             pk = "0x" + pk
@@ -130,9 +130,33 @@ class PositionClaimer:
         # Timestamp until which we skip claim attempts (grace period)
         self._skip_until: float = 0.0
 
-        # Web3 setup (Polygon PoA chain) — custom RPC or fallback
+        # Web3 setup (Polygon PoA chain) — custom RPC or fallback con retry su RPC alternativi
         rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        rpc_options = [rpc_url]
+        # RPC alternativi se quello principale fallisce
+        if rpc_url == "https://polygon-rpc.com" or not rpc_url:
+            rpc_options.extend([
+                "https://polygon-rpc.publicnode.com",
+                "https://rpc-mainnet.maticvigil.com",
+                "https://matic-mainnet.chainstacklabs.com",
+            ])
+        
+        self.w3 = None
+        for rpc in rpc_options:
+            try:
+                print(f"[Claimer] Provo RPC: {rpc}")
+                self.w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 10}))
+                # Test connessione
+                _ = self.w3.eth.chain_id
+                print(f"[Claimer] ✅ RPC funzionante: {rpc}")
+                break
+            except Exception as e:
+                print(f"[Claimer] ⚠️  RPC {rpc} fallito: {e}")
+                continue
+        
+        if not self.w3:
+            raise Exception("Nessun RPC Polygon funzionante disponibile. Configura POLYGON_RPC_URL con un RPC valido.")
+        
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
         # Contract instances
@@ -163,10 +187,15 @@ class PositionClaimer:
         else:
             self.http = httpx.Client(http2=True, timeout=30.0)
 
-        # Derive proxy wallet address on-chain
-        self.poly_proxy_address = self._get_poly_proxy_address()
-        print(f"[Claimer] EOA: {self.eoa_address}")
-        print(f"[Claimer] Proxy wallet: {self.poly_proxy_address}")
+        # Derive proxy wallet address on-chain (o usa quello passato)
+        if poly_proxy_address:
+            self.poly_proxy_address = poly_proxy_address
+            print(f"[Claimer] EOA: {self.eoa_address}")
+            print(f"[Claimer] Proxy wallet (fornito): {self.poly_proxy_address}")
+        else:
+            self.poly_proxy_address = self._get_poly_proxy_address()
+            print(f"[Claimer] EOA: {self.eoa_address}")
+            print(f"[Claimer] Proxy wallet: {self.poly_proxy_address}")
         try:
             pol = self.w3.eth.get_balance(self.eoa_address) / 10**18
             print(f"[Claimer] POL balance: {pol:.4f}")
@@ -175,9 +204,15 @@ class PositionClaimer:
 
     def _get_poly_proxy_address(self) -> str:
         """Get the Polymarket proxy wallet address for this EOA."""
-        return self.exchange.functions.getPolyProxyWalletAddress(
-            self.eoa_address
-        ).call()
+        try:
+            return self._rpc_call_with_retry(
+                lambda: self.exchange.functions.getPolyProxyWalletAddress(
+                    self.eoa_address
+                ).call()
+            )
+        except Exception as e:
+            print(f"[Claimer] ⚠️  Impossibile ottenere proxy wallet: {e}")
+            raise
 
     def _rpc_call_with_retry(self, fn, max_retries=5):
         """Execute an RPC call with retry on rate limit (exponential backoff)."""
