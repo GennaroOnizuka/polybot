@@ -136,9 +136,11 @@ class PositionClaimer:
         # RPC alternativi se quello principale fallisce
         if rpc_url == "https://polygon-rpc.com" or not rpc_url:
             rpc_options.extend([
-                "https://polygon-rpc.publicnode.com",
-                "https://rpc-mainnet.maticvigil.com",
-                "https://matic-mainnet.chainstacklabs.com",
+                "https://polygon.drpc.org",
+                "https://polygon-public.nodies.app",
+                "https://1rpc.io/matic",
+                "https://polygon.api.onfinality.io/public",
+                "https://polygon-mainnet.gateway.tatum.io",
             ])
         
         self.w3 = None
@@ -240,7 +242,8 @@ class PositionClaimer:
                 ).call()
             )
             return raw / 1e6
-        except Exception:
+        except Exception as e:
+            print(f"[Claimer] ⚠️  balanceOf fallito per token {str(token_id)[:20]}...: {e}")
             return 0.0
 
     # ── 1. Fetch redeemable positions ───────────────────────────────────────
