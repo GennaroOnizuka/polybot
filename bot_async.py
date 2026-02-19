@@ -577,7 +577,7 @@ class PolymarketBot:
         cooldown_sec = int(os.getenv("COOLDOWN_SECONDS", "300"))
         refresh_sec = int(os.getenv("REFRESH_MARKETS_SECONDS", "90"))
         max_buy_price = float(os.getenv("MAX_BUY_PRICE", "0.95"))
-        bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "180"))
+        bet_window_sec = int(os.getenv("BET_WINDOW_SECONDS", "90"))
 
         last_order_ts = None
         last_refresh_ts = time.time()
